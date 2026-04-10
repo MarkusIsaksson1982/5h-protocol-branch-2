@@ -316,6 +316,11 @@ class ContactRequest(BaseModel):
     preferred_outcome: PreferredOutcome
     consent_receipts: list[ConsentReceipt] = Field(default_factory=list)
     proxy_authorization: ProxyAuthorization | None = None
+    requester_public_key_b64: str | None = None  # Ed25519 public key, base64url, 32 bytes raw
+    # When present: proxy performs full semantic Ed25519 verification (v0.3+).
+    # When absent: proxy falls back to structural-only verification or rejects
+    #              if REQUIRE_SEMANTIC_VERIFICATION=true.
+    # See spec/execution/canonical-serialization.md for signing protocol.
     rate_limit_token: str | None = None
     ttl_hops: int = Field(default=5, ge=1, le=9)
     signature: str
