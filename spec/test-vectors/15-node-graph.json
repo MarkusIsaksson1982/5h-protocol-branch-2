@@ -1,0 +1,309 @@
+{
+  "_meta": {
+    "description": "5H Protocol – Synthetic 15-Node Test Vector Graph",
+    "version": "0.2.0-draft",
+    "author": "Claude, Anthropic",
+    "timestamp": "2026-04-10T18:50:00+02:00",
+    "purpose": "Reference test graph for implementers. Exercises all major node types, verification levels, threat scenarios, and protocol behaviors. All DIDs, keys, and signatures are synthetic placeholders; do not use in production.",
+    "known_paths": {
+      "A_to_M": {
+        "description": "Individual (Level-1) to organization executive (Level-2). Human-only path.",
+        "shortest_path": ["did:5h:alice", "did:5h:carol", "did:5h:frank", "did:5h:acme-gateway", "did:5h:margaret"],
+        "hop_count": 4,
+        "notes": "Org gateway (acme-gateway) adds 1 mandatory internal hop. Margaret is the designated contact."
+      },
+      "A_to_M_with_proxy": {
+        "description": "Same endpoints, but Alice and Margaret have both opted in to proxy-claude.",
+        "shortest_path": ["did:5h:alice", "did:5h:proxy-claude", "did:5h:acme-gateway", "did:5h:margaret"],
+        "hop_count": 3,
+        "notes": "AI proxy reduces path length by 1 by skipping carol+frank. Requires dual opt-in to be valid."
+      },
+      "B_to_N": {
+        "description": "Level-0 unverified node attempts to reach Level-2 target.",
+        "shortest_path": ["did:5h:bob-unverified", "did:5h:carol", "did:5h:frank", "did:5h:nil-bridge", "did:5h:nina-mastodon"],
+        "hop_count": 4,
+        "expected_behavior": "Carol's policy allows Level-0 forwarding with vouch. Frank's policy allows cross-bridge relay. Bridge nil-bridge strips requester DID before handing to Mastodon. Nina receives a pseudonymized request.",
+        "threat_exercised": "A1 (spam), A6 (Sybil inflation) — Bob is flagged as a Level-0 node; carol's vouch_budget is decremented."
+      },
+      "X_blocked": {
+        "description": "Requester (Xavier, a harasser) is on Alice's blocklist.",
+        "expected_behavior": "Any path traversing Alice as intermediary MUST be rejected at Alice's hop with failure_class='hard'. Alternate path through Grace does not exist (Grace is also on Xavier's blocklist — Xavier cannot even see Grace). System returns no viable path.",
+        "threat_exercised": "A2 (targeted harassment)"
+      },
+      "Sybil_inflation_attempt": {
+        "description": "Sam (Level-0 Sybil cluster: sam-s1 through sam-s4) attempts to appear closer to Margaret than they are.",
+        "expected_behavior": "All sam-s* nodes have no vouch from a Level-1+ node. Margaret's org policy is 'verified-only'. No sam-s* node may establish an edge with a Level-1+ node without consuming a vouch credit. Since no vouch credits have been spent, all sam-s* nodes are invisible to Level-1+ path discovery.",
+        "threat_exercised": "A6 (Sybil inflation)"
+      },
+      "Reachability_enumeration_attempt": {
+        "description": "Xavier issues 20 rapid reachability queries to map Alice's neighborhood.",
+        "expected_behavior": "After 5 queries within 60 seconds, Xavier's query is rate-limited with a pow_challenge. Returned hop counts include Laplace noise (±1); exact graph topology is not inferrable. Bloom filter returns 'reachable within 2-5 hops' rather than exact count.",
+        "threat_exercised": "A3 (graph topology adversary)"
+      }
+    }
+  },
+
+  "schema_version": "0.2.0-draft",
+
+  "nodes": [
+
+    {
+      "id": "did:5h:alice",
+      "type": "individual",
+      "label": "Alice",
+      "verification_level": 1,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_ALICE_PUBKEY_BASE64URL" },
+      "visibility": "fof",
+      "blocklist": ["did:5h:xavier"],
+      "ai_proxy_allowed": true,
+      "ai_proxy_config": {
+        "model": "claude-sonnet-4",
+        "model_version_hash": "SYNTH_HASH_A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1",
+        "instructions": "Forward professional inquiries. Summarize commercial proposals. Reject spam.",
+        "capabilities": ["summarization", "neutrality-enforcement"],
+        "consent_expiry": "2026-10-10T00:00:00+02:00"
+      },
+      "vouch_budget": { "credits_remaining": 3, "credits_max": 5, "last_restore_timestamp": "2026-04-03T00:00:00+02:00" }
+    },
+
+    {
+      "id": "did:5h:bob-unverified",
+      "type": "individual",
+      "label": "Bob (Level-0, unverified)",
+      "verification_level": 0,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_BOB_PUBKEY_BASE64URL" },
+      "visibility": "public",
+      "blocklist": [],
+      "ai_proxy_allowed": false,
+      "_test_note": "Sybil-risk node. Has no vouch from Level-1+. Cannot initiate edges into verified subgraph without sponsorship."
+    },
+
+    {
+      "id": "did:5h:carol",
+      "type": "individual",
+      "label": "Carol",
+      "verification_level": 1,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_CAROL_PUBKEY_BASE64URL" },
+      "visibility": "fof",
+      "blocklist": [],
+      "ai_proxy_allowed": false,
+      "vouch_budget": { "credits_remaining": 5, "credits_max": 5, "last_restore_timestamp": "2026-04-03T00:00:00+02:00" },
+      "_test_note": "Carol is a mutual connection between Alice and Frank. Vouches for Bob on the B→N path, consuming 1 vouch credit."
+    },
+
+    {
+      "id": "did:5h:dave",
+      "type": "individual",
+      "label": "Dave",
+      "verification_level": 2,
+      "public_key": { "key_alg": "ml-dsa-87", "key_value": "SYNTH_DAVE_PQ_PUBKEY_BASE64URL" },
+      "visibility": "verified",
+      "blocklist": [],
+      "ai_proxy_allowed": false,
+      "_test_note": "Dave uses post-quantum key (ML-DSA-87). Tests key_alg negotiation in client implementations."
+    },
+
+    {
+      "id": "did:5h:eve-escrow",
+      "type": "artificial_interim",
+      "label": "Eve (Escrow Agent)",
+      "verification_level": 1,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_EVE_PUBKEY_BASE64URL" },
+      "visibility": "public",
+      "blocklist": [],
+      "ai_proxy_allowed": true,
+      "ai_proxy_config": {
+        "model": "escrow-service-v1",
+        "model_version_hash": "SYNTH_HASH_EVE_ESCROW_1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF12345678",
+        "instructions": "Hold full message content in escrow pending dual approval from requester and target. Never forward without both approvals.",
+        "capabilities": ["escrow"],
+        "consent_expiry": "2026-12-31T00:00:00+02:00"
+      },
+      "_test_note": "Neutral escrow node. Tests escrow decision path and /v1/proxy/escrow/{token}/release endpoint."
+    },
+
+    {
+      "id": "did:5h:frank",
+      "type": "individual",
+      "label": "Frank",
+      "verification_level": 1,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_FRANK_PUBKEY_BASE64URL" },
+      "visibility": "fof",
+      "blocklist": [],
+      "ai_proxy_allowed": false,
+      "vouch_budget": { "credits_remaining": 2, "credits_max": 5, "last_restore_timestamp": "2026-04-01T00:00:00+02:00" }
+    },
+
+    {
+      "id": "did:5h:grace",
+      "type": "individual",
+      "label": "Grace",
+      "verification_level": 1,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_GRACE_PUBKEY_BASE64URL" },
+      "visibility": "fof",
+      "blocklist": ["did:5h:xavier"],
+      "_test_note": "Grace has blocked Xavier. Combined with Alice's block, Xavier has no viable path to the verified subgraph."
+    },
+
+    {
+      "id": "did:5h:xavier",
+      "type": "individual",
+      "label": "Xavier (blocked harasser)",
+      "verification_level": 1,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_XAVIER_PUBKEY_BASE64URL" },
+      "visibility": "public",
+      "blocklist": [],
+      "_test_note": "Threat vector A2. Xavier is blocked by both Alice and Grace. Implementations must verify that Xavier receives no path to the Alice–Grace subgraph without revealing blocklist membership."
+    },
+
+    {
+      "id": "did:5h:proxy-claude",
+      "type": "artificial_interim",
+      "label": "Claude AI Proxy (owned by Alice)",
+      "verification_level": 1,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_PROXY_CLAUDE_PUBKEY_BASE64URL" },
+      "visibility": "public",
+      "ai_proxy_allowed": true,
+      "ai_proxy_config": {
+        "model": "claude-sonnet-4",
+        "model_version_hash": "SYNTH_HASH_A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1",
+        "instructions": "Summarize and forward professional inquiries. Apply neutrality-enforcement. Reject any request where intent_type='commercial_proposal' unless requester is Level-2.",
+        "capabilities": ["summarization", "neutrality-enforcement"],
+        "consent_expiry": "2026-10-10T00:00:00+02:00"
+      },
+      "_test_note": "Tests dual opt-in AI proxy path. Alice owns this proxy. Both Alice (requester's node) and Margaret (target) must have authorized model_version_hash. Tests model_version_hash mismatch rejection when hash doesn't match registered config."
+    },
+
+    {
+      "id": "did:5h:acme-org",
+      "type": "organization",
+      "label": "Acme Corp (organization account)",
+      "verification_level": 2,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_ACME_ORG_PUBKEY_BASE64URL" },
+      "visibility": "verified",
+      "org_policy": {
+        "accept_policy": "verified-only",
+        "interim_node_count_min": 1,
+        "interim_node_count_max": 3
+      },
+      "blocklist": []
+    },
+
+    {
+      "id": "did:5h:acme-gateway",
+      "type": "artificial_interim",
+      "label": "Acme Corp Internal Gateway",
+      "verification_level": 2,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_ACME_GW_PUBKEY_BASE64URL" },
+      "visibility": "verified",
+      "gateway_consent": "role_required",
+      "ai_proxy_allowed": false,
+      "_test_note": "gateway_consent='role_required' means the employee in this role did not voluntarily opt in. Conforming clients surface this to requesters."
+    },
+
+    {
+      "id": "did:5h:margaret",
+      "type": "individual",
+      "label": "Margaret (Acme executive, designated contact)",
+      "verification_level": 2,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_MARGARET_PUBKEY_BASE64URL" },
+      "visibility": "verified",
+      "ai_proxy_allowed": true,
+      "ai_proxy_config": {
+        "model": "claude-sonnet-4",
+        "model_version_hash": "SYNTH_HASH_A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1B2C3D4E5F6A1",
+        "instructions": "Screen all inbound requests. Accept only professional_inquiry and research_collaboration. Escrow all others.",
+        "capabilities": ["summarization", "escrow"],
+        "consent_expiry": "2027-01-01T00:00:00+02:00"
+      },
+      "blocklist": []
+    },
+
+    {
+      "id": "did:5h:nil-bridge",
+      "type": "bridge",
+      "label": "Nil Bridge (Mastodon federation)",
+      "verification_level": 1,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_NIL_BRIDGE_PUBKEY_BASE64URL" },
+      "visibility": "public",
+      "bridge_config": {
+        "external_network": "mastodon",
+        "metadata_strip_policy": {
+          "strips_requester_did": true,
+          "strips_consent_receipts": false,
+          "strips_verification_level": false,
+          "strips_intent_structured": false
+        },
+        "attestation_signature": "SYNTH_NIL_BRIDGE_ATTESTATION_SIGNATURE"
+      },
+      "_test_note": "Tests bridge node type. Strips requester DID before handing off to Mastodon, preserving anonymity. Consent receipts are preserved so the chain is still auditable. Tests bridge relay edge type."
+    },
+
+    {
+      "id": "did:5h:nina-mastodon",
+      "type": "individual",
+      "label": "Nina (reachable via Mastodon bridge)",
+      "verification_level": 1,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_NINA_PUBKEY_BASE64URL" },
+      "visibility": "public",
+      "ai_proxy_allowed": false,
+      "_test_note": "Nina's canonical identity is her Mastodon handle; her did:5h: is registered via the nil-bridge. Tests cross-network reachability."
+    },
+
+    {
+      "id": "did:5h:sam-s1",
+      "type": "individual",
+      "label": "Sam-S1 (Sybil node 1 of 4)",
+      "verification_level": 0,
+      "public_key": { "key_alg": "ed25519", "key_value": "SYNTH_SAM_S1_PUBKEY_BASE64URL" },
+      "visibility": "public",
+      "blocklist": [],
+      "_test_note": "Sybil cluster node. No Level-1+ vouch. Should be invisible to path discovery in the verified subgraph."
+    }
+  ],
+
+  "edges": [
+
+    { "from": "did:5h:alice", "to": "did:5h:carol", "type": "handshake", "strength": "strong", "mutual_consent": true, "timestamp": "2025-01-15T10:00:00+02:00" },
+    { "from": "did:5h:alice", "to": "did:5h:grace", "type": "handshake", "strength": "strong", "mutual_consent": true, "timestamp": "2025-03-01T10:00:00+02:00" },
+    { "from": "did:5h:alice", "to": "did:5h:proxy-claude", "type": "org_internal", "strength": "strong", "mutual_consent": true, "timestamp": "2026-01-01T00:00:00+02:00" },
+    { "from": "did:5h:bob-unverified", "to": "did:5h:carol", "type": "handshake", "strength": "weak", "mutual_consent": true, "timestamp": "2026-02-10T09:00:00+02:00", "vouched_by": "did:5h:carol", "_test_note": "Carol spent 1 vouch credit to establish this edge." },
+    { "from": "did:5h:carol", "to": "did:5h:frank", "type": "handshake", "strength": "strong", "mutual_consent": true, "timestamp": "2024-11-01T10:00:00+02:00" },
+    { "from": "did:5h:carol", "to": "did:5h:dave", "type": "verified_link", "strength": "strong", "mutual_consent": true, "timestamp": "2025-06-01T10:00:00+02:00" },
+    { "from": "did:5h:dave", "to": "did:5h:margaret", "type": "handshake", "strength": "weak", "mutual_consent": true, "timestamp": "2025-09-15T10:00:00+02:00" },
+    { "from": "did:5h:frank", "to": "did:5h:acme-org", "type": "verified_link", "strength": "strong", "mutual_consent": true, "timestamp": "2025-07-01T10:00:00+02:00" },
+    { "from": "did:5h:acme-org", "to": "did:5h:acme-gateway", "type": "org_internal", "strength": "strong", "mutual_consent": true, "timestamp": "2025-07-01T10:00:00+02:00" },
+    { "from": "did:5h:acme-gateway", "to": "did:5h:margaret", "type": "org_internal", "strength": "strong", "mutual_consent": true, "timestamp": "2025-07-01T10:00:00+02:00" },
+    { "from": "did:5h:margaret", "to": "did:5h:proxy-claude", "type": "handshake", "strength": "weak", "mutual_consent": true, "timestamp": "2026-02-01T00:00:00+02:00", "_test_note": "Margaret's opt-in to proxy-claude. Combined with Alice's ownership, the dual opt-in requirement for the A→M_with_proxy path is satisfied." },
+    { "from": "did:5h:frank", "to": "did:5h:nil-bridge", "type": "handshake", "strength": "weak", "mutual_consent": true, "timestamp": "2025-10-01T10:00:00+02:00" },
+    { "from": "did:5h:nil-bridge", "to": "did:5h:nina-mastodon", "type": "bridge_relay", "strength": "weak", "mutual_consent": true, "timestamp": "2025-10-01T10:00:00+02:00" },
+    { "from": "did:5h:eve-escrow", "to": "did:5h:margaret", "type": "handshake", "strength": "weak", "mutual_consent": true, "timestamp": "2026-01-15T10:00:00+02:00" },
+    { "from": "did:5h:xavier", "to": "did:5h:carol", "type": "handshake", "strength": "weak", "mutual_consent": true, "timestamp": "2025-05-01T10:00:00+02:00", "_test_note": "Xavier has a mutual handshake with Carol, giving him apparent graph proximity — but Alice and Grace have blocked him, so no viable path to the Alice-Grace-Frank subgraph exists from Xavier." }
+  ],
+
+  "revocation_log": [
+    {
+      "revoked_edge_from": "did:5h:sam-s1",
+      "revoked_edge_to": "did:5h:carol",
+      "revocation_timestamp": "2026-03-15T12:00:00+02:00",
+      "deletion_proof": "SYNTH_TOMBSTONE_HASH_SAM_S1_CAROL",
+      "broadcast_signature": "SYNTH_CAROL_REVOCATION_SIGNATURE",
+      "_test_note": "Carol revoked an edge previously established with Sam-S1 after identifying Sybil behavior. Tests EdgeRevocation broadcast and cache pruning requirement."
+    }
+  ],
+
+  "_expected_behaviors": {
+    "implementation_checklist": [
+      "Verify that path A→M returns hop_count=4 without AI proxy and hop_count=3 with valid dual proxy opt-in.",
+      "Verify that Xavier receives a 'no viable path' response without revealing that Alice and Grace are on his blocklist.",
+      "Verify that Bob's edge to Carol is valid only with Carol's vouch; Carol's vouch_budget.credits_remaining decrements by 1 after edge creation.",
+      "Verify that the nil-bridge strips requester DID before forwarding to Nina per its bridge_config.metadata_strip_policy.",
+      "Verify that acme-gateway surfaces gateway_consent='role_required' to requester clients.",
+      "Verify that proxy-claude rejects any request where the presented model_version_hash does not match its registered value.",
+      "Verify that sam-s1 is not returned in any path through the verified subgraph (no vouch, Level-0, revocation in log).",
+      "Verify that Dave's ML-DSA-87 public key is handled correctly by signature verification routines.",
+      "Verify that the RevocationLog entry causes Carol's routing cache to exclude sam-s1 as a potential next-hop.",
+      "Verify that reachability queries for Xavier→Alice return a bounded noisy hop estimate, not 'blocked', to avoid leaking blocklist membership."
+    ]
+  }
+}
