@@ -357,3 +357,4 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     model_version_hash: str
     schema_version: str = "0.2.0-draft"
+    public_key_b64: str = ""  # Ed25519 public key; populated by proxy at startup (fix C)
