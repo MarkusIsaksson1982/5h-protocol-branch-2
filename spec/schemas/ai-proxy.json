@@ -1,0 +1,366 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://5h-protocol.org/spec/schemas/ai-proxy.json",
+  "title": "5H Protocol – AI Proxy Wire Protocol Schemas",
+  "description": "JSON Schema definitions for the AI Proxy Wire Protocol: ContactRequest, ProxyResponse, ConsentReceipt, and EdgeRevocationAck. Based on Grok/xAI wire protocol specification; augmented with Claude/Anthropic additions (model_version_hash, consent_expiry, receipt_mode).",
+  "version": "0.2.0-draft",
+  "authors": [
+    "Grok/xAI (original ContactRequest, ProxyResponse, ConsentReceipt schemas)",
+    "Claude/Anthropic (model_version_hash binding, consent_expiry, receipt_mode)"
+  ],
+
+  "$defs": {
+
+    "DID": {
+      "type": "string",
+      "pattern": "^did:[a-z0-9]+:.+$"
+    },
+
+    "UUIDv7": {
+      "type": "string",
+      "description": "UUIDv7: time-ordered UUID. Preferred over v4 for sortable request IDs.",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+
+    "ISO8601": {
+      "type": "string",
+      "format": "date-time"
+    },
+
+    "ContactRequest": {
+      "title": "ContactRequest",
+      "description": "Payload sent to a proxy's POST /v1/proxy/forward endpoint. MUST be signed by the requester's private key and encrypted to the proxy's public key before transmission.",
+      "type": "object",
+      "required": [
+        "request_id",
+        "requester_did",
+        "target_did",
+        "hop_number",
+        "intent",
+        "preferred_outcome",
+        "consent_receipts",
+        "signature",
+        "encryption"
+      ],
+      "additionalProperties": false,
+      "properties": {
+
+        "request_id": {
+          "$ref": "#/$defs/UUIDv7",
+          "description": "Unique identifier for this contact request. Stable across all hops."
+        },
+
+        "requester_did": {
+          "$ref": "#/$defs/DID",
+          "description": "DID of the originating requester. MAY be masked (set to a pseudonym DID) if anonymity_level='full' or 'pseudonym'."
+        },
+
+        "target_did": {
+          "$ref": "#/$defs/DID",
+          "description": "DID of the intended final recipient."
+        },
+
+        "hop_number": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Current hop index in the chain. Hop 1 = first intermediary after requester. Implementations MUST reject requests with hop_number exceeding their configured max-hops policy."
+        },
+
+        "intent": {
+          "type": "object",
+          "required": ["summary", "anonymity_level", "intent_type"],
+          "additionalProperties": false,
+          "properties": {
+            "intent_type": {
+              "type": "string",
+              "description": "Structured intent category for deterministic filtering by intermediaries before AI processing. (Gemini/Google recommendation.)",
+              "enum": [
+                "professional_inquiry",
+                "personal_connection",
+                "urgent_contact",
+                "commercial_proposal",
+                "research_collaboration",
+                "media_request",
+                "other"
+              ]
+            },
+            "summary": {
+              "type": "string",
+              "maxLength": 500,
+              "description": "Short, plain-language summary of the request intent. Shown to every intermediary node."
+            },
+            "full_text": {
+              "type": "string",
+              "description": "Optional full message body. MUST be encrypted separately; intermediaries see only the summary unless they are the escrow or final target."
+            },
+            "anonymity_level": {
+              "type": "string",
+              "enum": ["full", "pseudonym", "identified"],
+              "description": "Requester's desired identity disclosure level. 'full': requester DID is masked at all hops. 'pseudonym': consistent pseudonym DID used. 'identified': true DID disclosed."
+            }
+          }
+        },
+
+        "preferred_outcome": {
+          "type": "string",
+          "enum": ["forward", "summarize", "escrow", "connect"],
+          "description": "Requester's preference for how this hop handles the request. Intermediary may override based on its own policy."
+        },
+
+        "consent_receipts": {
+          "type": "array",
+          "description": "Ordered array of ConsentReceipt objects emitted by all previous hops. Receipt chain mode is determined by the receipt_mode field of the first receipt.",
+          "items": { "$ref": "#/$defs/ConsentReceipt" }
+        },
+
+        "proxy_authorization": {
+          "type": "object",
+          "description": "Evidence that both requester and target have authorized this specific proxy to act as an interim node. Required when routing through an AI proxy node.",
+          "required": ["proxy_did", "model_version_hash", "requester_auth_signature", "target_auth_signature"],
+          "additionalProperties": false,
+          "properties": {
+            "proxy_did": { "$ref": "#/$defs/DID" },
+            "model_version_hash": {
+              "type": "string",
+              "description": "SHA-256 hash committing to the specific model version and system prompt the proxy is running. MUST match the value in the proxy node's ai_proxy_config at the time of consent. If the proxy has updated its configuration since consent was granted, this request MUST be rejected and a new opt-in cycle initiated. (Claude/Anthropic recommendation.)",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "consent_expiry": {
+              "$ref": "#/$defs/ISO8601",
+              "description": "Timestamp after which this proxy authorization is no longer valid. Proxy MUST reject requests with an expired authorization."
+            },
+            "requester_auth_signature": {
+              "type": "string",
+              "description": "Requester's signature over (proxy_did || model_version_hash || consent_expiry || request_id)."
+            },
+            "target_auth_signature": {
+              "type": "string",
+              "description": "Target's pre-authorization signature over (proxy_did || model_version_hash || consent_expiry). May be a standing authorization or per-request."
+            }
+          }
+        },
+
+        "rate_limit_token": {
+          "type": "string",
+          "description": "Optional. Proof-of-work nonce or vouch credit receipt satisfying the receiving node's rate-limit policy. Required for Level-0 requesters when the intermediary enforces Sybil-resistance rules."
+        },
+
+        "ttl_hops": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9,
+          "description": "Maximum remaining hops before this request expires. Each intermediary MUST decrement by 1 before forwarding. If ttl_hops reaches 0, the intermediary MUST reject with a 'ttl_expired' error."
+        },
+
+        "signature": {
+          "type": "string",
+          "description": "Ed25519 (or ML-DSA-87) signature by the requester's private key over the canonical JSON serialization of this object (with the 'signature' field set to empty string). Intermediaries MUST verify before acting."
+        },
+
+        "encryption": {
+          "type": "string",
+          "enum": ["aes-256-gcm", "xchacha20-poly1305", "pq-hybrid-kyber768"],
+          "description": "Encryption algorithm used for full_text and any other encrypted subfields. 'pq-hybrid-kyber768' is the post-quantum hybrid option."
+        }
+      }
+    },
+
+    "ProxyResponse": {
+      "title": "ProxyResponse",
+      "description": "Response returned by a proxy's /v1/proxy/forward endpoint. Always includes a signed ConsentReceipt.",
+      "type": "object",
+      "required": ["request_id", "decision", "consent_receipt"],
+      "additionalProperties": false,
+      "properties": {
+
+        "request_id": { "$ref": "#/$defs/UUIDv7" },
+
+        "decision": {
+          "type": "string",
+          "enum": ["forward", "reject", "summarize", "escrow", "accept-and-connect"],
+          "description": "The action this proxy is taking. 'forward': passing to next hop. 'reject': chain ends here. 'summarize': summarized version forwarded. 'escrow': held pending dual approval. 'accept-and-connect': proxy is the terminal node and accepts on behalf of target."
+        },
+
+        "summary": {
+          "type": "string",
+          "maxLength": 300,
+          "description": "AI-generated summary of the request intent. Required when decision='summarize'. MUST NOT include information not present in the original summary field."
+        },
+
+        "escrow_token": {
+          "type": "string",
+          "description": "Opaque token for escrow release. Required when decision='escrow'. The target uses this token to retrieve the full message upon approval via /v1/proxy/escrow/{escrow_token}/release."
+        },
+
+        "next_hop_did": {
+          "$ref": "#/$defs/DID",
+          "description": "DID of the next intermediary or target. Required when decision='forward' or 'summarize'."
+        },
+
+        "failure_class": {
+          "type": "string",
+          "enum": ["soft", "hard", "critical"],
+          "description": "When decision='reject': classifies the failure type. 'soft': requester may retry with modifications. 'hard': requires chain rollback (e.g. blocklist hit). 'critical': abort and escalate (e.g. policy violation, detected prompt injection). (ChatGPT/OpenAI failure taxonomy.)"
+        },
+
+        "consent_receipt": { "$ref": "#/$defs/ConsentReceipt" },
+
+        "error": {
+          "type": "object",
+          "description": "Human-readable error details. Required when decision='reject'.",
+          "properties": {
+            "code": {
+              "type": "string",
+              "enum": [
+                "blocklist_hit",
+                "verification_level_insufficient",
+                "rate_limit_exceeded",
+                "ttl_expired",
+                "proxy_config_mismatch",
+                "consent_expired",
+                "prompt_injection_detected",
+                "policy_violation",
+                "internal_error"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "maxLength": 200
+            },
+            "rate_limit_retry_after": {
+              "$ref": "#/$defs/ISO8601",
+              "description": "When code='rate_limit_exceeded': earliest timestamp the requester may retry."
+            },
+            "pow_challenge": {
+              "type": "string",
+              "description": "When code='rate_limit_exceeded' and the node uses proof-of-work: the challenge nonce the requester must solve to bypass the limit."
+            }
+          }
+        }
+      }
+    },
+
+    "ConsentReceipt": {
+      "title": "ConsentReceipt",
+      "description": "Cryptographic record emitted by every node (human or AI) that processes a ContactRequest. The chain of receipts provides the audit trail. receipt_mode controls whether the target receives the full chain or a privacy-preserving alternative.",
+      "type": "object",
+      "required": ["receipt_id", "hop_number", "proxy_did", "timestamp", "action_hash", "signature", "receipt_mode"],
+      "additionalProperties": false,
+      "properties": {
+
+        "receipt_id": { "$ref": "#/$defs/UUIDv7" },
+
+        "hop_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+
+        "proxy_did": {
+          "$ref": "#/$defs/DID",
+          "description": "DID of the node issuing this receipt. For human nodes, this is their personal DID. For AI proxies, this is the owner DID of the proxy."
+        },
+
+        "timestamp": { "$ref": "#/$defs/ISO8601" },
+
+        "action_hash": {
+          "type": "string",
+          "description": "SHA-256 hash of the canonical serialization of (request_id || hop_number || decision || timestamp). Binds the receipt to the specific action taken.",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+
+        "chain_root_hash": {
+          "type": "string",
+          "description": "When receipt_mode='merkle_root' or 'blind': SHA-256 Merkle root over all prior receipts in the chain, including this one. The target verifies chain integrity against this root without seeing individual hop identities.",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+
+        "receipt_mode": {
+          "type": "string",
+          "enum": ["full_chain", "merkle_root", "blind"],
+          "description": "Controls how the receipt chain is presented to the final target. 'full_chain': target receives all receipts including intermediary DIDs (v0.1 default; maximum auditability, minimum privacy). 'merkle_root': target receives only chain_root_hash; individual hop identities are withheld; an authorized auditor (with both parties' consent) may open the full chain. 'blind': blind-signature scheme; each hop signs without seeing prior hop identities; provides strongest privacy guarantee. (Claude/Anthropic recommendation; 'full_chain' is default for backward compatibility.)",
+          "default": "full_chain"
+        },
+
+        "model_version_hash": {
+          "type": "string",
+          "description": "For AI proxy hops only: SHA-256 hash of (model_id || system_prompt_template) at the time this action was taken. Verifiable against the proxy's registered ai_proxy_config. Allows target to confirm the proxy configuration they consented to was the one actually used.",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+
+        "signature": {
+          "type": "string",
+          "description": "Signature by the issuing node's private key over (receipt_id || hop_number || proxy_did || timestamp || action_hash || chain_root_hash || receipt_mode). MUST be verifiable against the node's registered public_key."
+        }
+      }
+    },
+
+    "RedactionRequest": {
+      "title": "RedactionRequest",
+      "description": "Payload for POST /v1/proxy/redact/{request_id}. Triggers deletion of local logs and returns a cryptographic proof of deletion.",
+      "type": "object",
+      "required": ["request_id", "requester_did", "signature"],
+      "additionalProperties": false,
+      "properties": {
+        "request_id": { "$ref": "#/$defs/UUIDv7" },
+        "requester_did": { "$ref": "#/$defs/DID" },
+        "signature": {
+          "type": "string",
+          "description": "Requester's signature over (request_id || requester_did || 'REDACT'). Proxy MUST verify before acting."
+        }
+      }
+    },
+
+    "RedactionProof": {
+      "title": "RedactionProof",
+      "description": "Response to a RedactionRequest. Cryptographic proof that the proxy has deleted its local log entries for the specified request.",
+      "type": "object",
+      "required": ["request_id", "deletion_timestamp", "deletion_hash", "proxy_signature"],
+      "additionalProperties": false,
+      "properties": {
+        "request_id": { "$ref": "#/$defs/UUIDv7" },
+        "deletion_timestamp": { "$ref": "#/$defs/ISO8601" },
+        "deletion_hash": {
+          "type": "string",
+          "description": "SHA-256 tombstone: hash of (request_id || proxy_did || deletion_timestamp || 'DELETED'). Proves specific content was deleted at this time without reproducing the deleted content.",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "proxy_signature": {
+          "type": "string",
+          "description": "Proxy owner's signature over deletion_hash."
+        }
+      }
+    }
+
+  },
+
+  "x-endpoints": {
+    "description": "Required HTTP endpoints for any conforming AI proxy node.",
+    "endpoints": [
+      {
+        "method": "POST",
+        "path": "/v1/proxy/forward",
+        "request_body": { "$ref": "#/$defs/ContactRequest" },
+        "response_body": { "$ref": "#/$defs/ProxyResponse" },
+        "auth": "Ed25519 signature on request body; proxy verifies before acting"
+      },
+      {
+        "method": "POST",
+        "path": "/v1/proxy/redact/{request_id}",
+        "request_body": { "$ref": "#/$defs/RedactionRequest" },
+        "response_body": { "$ref": "#/$defs/RedactionProof" },
+        "auth": "Ed25519 signature on request body"
+      },
+      {
+        "method": "GET",
+        "path": "/v1/proxy/escrow/{escrow_token}/release",
+        "description": "Target calls this to release a held escrow after mutual approval. Auth: target's DID signature."
+      },
+      {
+        "method": "GET",
+        "path": "/v1/proxy/health",
+        "description": "Returns proxy liveness status and current model_version_hash for verification."
+      }
+    ]
+  }
+}
