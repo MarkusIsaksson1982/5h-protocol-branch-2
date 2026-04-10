@@ -1,0 +1,274 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://5h-protocol.org/spec/schemas/graph-model.json",
+  "title": "5H Protocol Graph Model",
+  "description": "JSON Schema for the 5H Protocol graph: nodes (individuals, organizations, AI proxies, bridges) and edges (handshakes, org-internal links, verified links). Incorporates all cross-model commentary additions as of 2026-04-10.",
+  "version": "0.2.0-draft",
+  "authors": [
+    "Grok/xAI (original graph schema, wire protocol)",
+    "Claude/Anthropic (gateway_consent, model_version_hash, consent_expiry, receipt_mode)",
+    "Gemini/Google (bridge node type, intent_type enum, EdgeRevocation)",
+    "Muse Spark/Meta (key_alg field)",
+    "ChatGPT/OpenAI (failure_class on edges)"
+  ],
+
+  "type": "object",
+  "required": ["nodes", "edges"],
+  "additionalProperties": false,
+
+  "properties": {
+    "nodes": {
+      "type": "array",
+      "description": "All participants in the graph: individuals, organizations, AI proxy nodes, and bridge nodes.",
+      "items": { "$ref": "#/$defs/Node" }
+    },
+    "edges": {
+      "type": "array",
+      "description": "All authenticated connections between nodes.",
+      "items": { "$ref": "#/$defs/Edge" }
+    },
+    "revocation_log": {
+      "type": "array",
+      "description": "Append-only log of EdgeRevocation broadcasts. Required for right-to-be-forgotten compliance in federated deployments.",
+      "items": { "$ref": "#/$defs/EdgeRevocation" }
+    },
+    "schema_version": {
+      "type": "string",
+      "description": "Semantic version of this schema. Implementations MUST reject graphs with incompatible major versions.",
+      "pattern": "^\\d+\\.\\d+\\.\\d+(-[a-z]+)?$"
+    }
+  },
+
+  "$defs": {
+
+    "DID": {
+      "type": "string",
+      "description": "Decentralized Identifier. MUST follow the did:5h: method or a compatible DID method.",
+      "pattern": "^did:[a-z0-9]+:.+$",
+      "examples": ["did:5h:abc123", "did:key:z6Mk..."]
+    },
+
+    "ISO8601": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp with timezone offset."
+    },
+
+    "VerificationLevel": {
+      "type": "integer",
+      "description": "0 = unverified (email/phone self-attest). 1 = social/OAuth (GitHub, LinkedIn, etc.). 2 = government ID or biometric via privacy-preserving ZK proof.",
+      "enum": [0, 1, 2]
+    },
+
+    "Node": {
+      "type": "object",
+      "required": ["id", "type", "verification_level", "public_key", "visibility"],
+      "additionalProperties": false,
+      "properties": {
+
+        "id": { "$ref": "#/$defs/DID" },
+
+        "type": {
+          "type": "string",
+          "description": "Node category. 'individual': human user. 'organization': institutional account with admin-designated gateways. 'artificial_interim': AI or automated agent node owned by an individual or org. 'bridge': gateway node connecting 5H graph to an external network (Signal, Mastodon, LinkedIn, etc.).",
+          "enum": ["individual", "organization", "artificial_interim", "bridge"]
+        },
+
+        "verification_level": { "$ref": "#/$defs/VerificationLevel" },
+
+        "public_key": {
+          "type": "object",
+          "required": ["key_alg", "key_value"],
+          "description": "Public key used for signature verification and encrypted payloads.",
+          "properties": {
+            "key_alg": {
+              "type": "string",
+              "description": "Algorithm identifier. 'ed25519' is the current default. 'ml-dsa-87' is reserved for post-quantum migration (per Muse Spark recommendation). Clients negotiate.",
+              "enum": ["ed25519", "ml-dsa-87", "ecdsa-p256"]
+            },
+            "key_value": {
+              "type": "string",
+              "description": "Base64url-encoded public key bytes."
+            }
+          }
+        },
+
+        "visibility": {
+          "type": "string",
+          "description": "Profile discovery scope. 'public': discoverable by all. 'fof': friends-of-friends only. 'verified': Level-1+ only. 'custom': governed by acl_list.",
+          "enum": ["public", "fof", "verified", "custom"]
+        },
+
+        "acl_list": {
+          "type": "array",
+          "description": "Explicit list of DIDs permitted to discover this profile when visibility='custom'. Ignored otherwise.",
+          "items": { "$ref": "#/$defs/DID" }
+        },
+
+        "blocklist": {
+          "type": "array",
+          "description": "DIDs that MUST NOT be routed to or from this node. Checked at every hop. Implementations MUST honor without revealing blocklist membership to the blocked party.",
+          "items": { "$ref": "#/$defs/DID" }
+        },
+
+        "ai_proxy_allowed": {
+          "type": "boolean",
+          "description": "Whether this node permits AI proxies to act on its behalf as interim nodes. Default: false.",
+          "default": false
+        },
+
+        "ai_proxy_config": {
+          "type": "object",
+          "description": "Configuration for AI proxy usage. Only meaningful when ai_proxy_allowed=true.",
+          "required": ["model", "model_version_hash", "instructions"],
+          "properties": {
+            "model": {
+              "type": "string",
+              "description": "Model identifier (e.g. 'claude-sonnet-4', 'gpt-4o'). Informational; model_version_hash is the binding commitment."
+            },
+            "model_version_hash": {
+              "type": "string",
+              "description": "SHA-256 hash of the model checkpoint identifier and system prompt template combined. Consent granted to a proxy is version-bound: if this value changes, a new opt-in cycle MUST be initiated. (Claude/Anthropic recommendation.)",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "instructions": {
+              "type": "string",
+              "description": "System prompt template governing the proxy's behavior. MUST be consistent with model_version_hash."
+            },
+            "capabilities": {
+              "type": "array",
+              "description": "Declared capabilities this proxy may exercise.",
+              "items": {
+                "type": "string",
+                "enum": ["summarization", "translation", "tone-matching", "neutrality-enforcement", "escrow"]
+              }
+            },
+            "consent_expiry": {
+              "type": "string",
+              "format": "date-time",
+              "description": "Optional expiry timestamp for proxy authorization. After this time, the proxy MUST NOT act without renewed explicit opt-in from both requester and target. (Claude/Anthropic recommendation.)"
+            }
+          }
+        },
+
+        "gateway_consent": {
+          "type": "string",
+          "description": "For nodes of type 'organization': whether the designated gateway role is held voluntarily or as a role requirement. 'voluntary' = employee or agent freely opted in. 'role_required' = organizational policy mandates this position. Conforming clients SHOULD surface this distinction to requesters. Omit for non-org nodes. (Claude/Anthropic recommendation.)",
+          "enum": ["voluntary", "role_required"]
+        },
+
+        "org_policy": {
+          "type": "object",
+          "description": "For type='organization': contact routing policy.",
+          "properties": {
+            "accept_policy": {
+              "type": "string",
+              "enum": ["accept-any", "verified-only", "requires-intent-description", "custom"]
+            },
+            "interim_node_count_min": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Minimum number of interim forwarding hops inside the org before reaching the designated contact."
+            },
+            "interim_node_count_max": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Maximum number of interim forwarding hops. Randomization within [min,max] provides spam damping while obscuring internal structure."
+            }
+          }
+        },
+
+        "bridge_config": {
+          "type": "object",
+          "description": "For type='bridge': declares the external network and metadata-handling policies. Bridge nodes MUST cryptographically attest to this declaration. (Gemini/Google recommendation.)",
+          "required": ["external_network", "metadata_strip_policy", "attestation_signature"],
+          "properties": {
+            "external_network": {
+              "type": "string",
+              "description": "Identifier of the external network this bridge connects to.",
+              "examples": ["signal", "mastodon", "linkedin", "email-smtp"]
+            },
+            "metadata_strip_policy": {
+              "type": "object",
+              "description": "Explicit declaration of which consent metadata fields the bridge strips before handing off to the external protocol.",
+              "properties": {
+                "strips_requester_did": { "type": "boolean" },
+                "strips_consent_receipts": { "type": "boolean" },
+                "strips_verification_level": { "type": "boolean" },
+                "strips_intent_structured": { "type": "boolean" }
+              }
+            },
+            "attestation_signature": {
+              "type": "string",
+              "description": "Bridge operator's Ed25519 signature over a canonical serialization of metadata_strip_policy. Verifiable against the bridge node's public_key."
+            }
+          }
+        },
+
+        "vouch_budget": {
+          "type": "object",
+          "description": "For Level-1+ nodes: vouch-limited edge creation budget. A Level-0 node may only establish edges if a Level-1+ node spends one vouch credit. Budget restores slowly (recommended: 1 credit per 7 days). (Claude/Anthropic + Muse Spark/Meta recommendation for Sybil resistance.)",
+          "properties": {
+            "credits_remaining": { "type": "integer", "minimum": 0 },
+            "credits_max": { "type": "integer", "minimum": 0 },
+            "last_restore_timestamp": { "$ref": "#/$defs/ISO8601" }
+          }
+        }
+      }
+    },
+
+    "Edge": {
+      "type": "object",
+      "required": ["from", "to", "type", "mutual_consent", "timestamp"],
+      "additionalProperties": false,
+      "properties": {
+        "from": { "$ref": "#/$defs/DID" },
+        "to": { "$ref": "#/$defs/DID" },
+        "type": {
+          "type": "string",
+          "enum": ["handshake", "org_internal", "verified_link", "bridge_relay"]
+        },
+        "strength": {
+          "type": "string",
+          "enum": ["strong", "weak", "fof"],
+          "description": "Relationship strength. Used as a secondary signal in path-scoring; does not affect consent requirements."
+        },
+        "mutual_consent": {
+          "type": "boolean",
+          "description": "MUST be true for all edges. An edge without mutual consent MUST NOT exist in a conforming graph."
+        },
+        "timestamp": { "$ref": "#/$defs/ISO8601" },
+        "vouched_by": {
+          "$ref": "#/$defs/DID",
+          "description": "If this edge was created by a Level-0 node, the DID of the Level-1+ node that spent a vouch credit to authorize it."
+        },
+        "crdt_vector_clock": {
+          "type": "object",
+          "description": "Vector clock entry for CRDT-based federated sync, keyed by node DID. Prevents race conditions during concurrent blocklist updates and handshake acceptances. (Gemini/Google recommendation.)",
+          "additionalProperties": { "type": "integer" }
+        }
+      }
+    },
+
+    "EdgeRevocation": {
+      "type": "object",
+      "description": "Broadcast record emitted when a node removes an edge. Intermediary nodes MUST prune routing caches on receipt. Backed by cryptographic proof of deletion. (Gemini/Google recommendation.)",
+      "required": ["revoked_edge_from", "revoked_edge_to", "revocation_timestamp", "deletion_proof", "broadcast_signature"],
+      "additionalProperties": false,
+      "properties": {
+        "revoked_edge_from": { "$ref": "#/$defs/DID" },
+        "revoked_edge_to": { "$ref": "#/$defs/DID" },
+        "revocation_timestamp": { "$ref": "#/$defs/ISO8601" },
+        "deletion_proof": {
+          "type": "string",
+          "description": "Cryptographic proof (e.g., SHA-256 tombstone against the original edge hash) that local storage of the edge has been deleted."
+        },
+        "broadcast_signature": {
+          "type": "string",
+          "description": "Signature by the revoking node's private key over (revoked_edge_from || revoked_edge_to || revocation_timestamp || deletion_proof)."
+        }
+      }
+    }
+
+  }
+}
