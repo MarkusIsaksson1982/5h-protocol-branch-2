@@ -3,33 +3,30 @@ five_h_proxy/verification.py
 
 Ed25519 signature verification for incoming ContactRequests.
 
-Current capability: STRUCTURAL verification only.
-  - Checks that `signature` is valid base64url
-  - Checks that it decodes to exactly 64 bytes (Ed25519 signature length)
-  - Rejects clearly malformed signatures
-  - Accepts structurally valid signatures with a logged warning
+Three verification modes, selected at runtime:
 
-Why not full semantic verification yet:
-  Branch 1 (Rust core, v0.2) signs over b"full-flow-request" — a hardcoded
-  placeholder, not the canonical JSON of the request. The requester keypair is
-  ephemeral and not registered in any DID-to-public-key store. We cannot verify
-  the signature content without both:
-    1. An agreed canonical signing input (sha256 of ContactRequest JSON minus
-       the signature field)
-    2. The requester's public key, either embedded in the request or looked up
-       from a DID registry
+  STRUCTURAL (always available)
+    Checks that `signature` is valid base64url and decodes to 64 bytes.
+    Accepts structurally valid signatures with a logged warning.
+    Error: POLICY_VIOLATION / HARD on structural failure.
 
-  TODO(v0.3 — branch sync required):
-    When Branch 1 implements a public key registry or embeds requester_public_key
-    in the ContactRequest payload:
-    1. Update verify_request_signature() to call _verify_ed25519()
-    2. Add the requester_public_key field to models.ContactRequest (optional, for
-       v0.2 compatibility)
-    3. Define canonical signing input as:
-         sha256(json.dumps(request_dict_without_signature, sort_keys=True))
-    4. Remove the structural-only warning log
+  SEMANTIC (when requester_public_key_b64 is present in the request)
+    Verifies the Ed25519 signature against:
+      SHA-256(RFC8785(ContactRequest_without_signature_field))
+    See spec/execution/canonical-serialization.md for the exact algorithm.
+    Error: POLICY_VIOLATION / HARD on semantic failure.
 
-This follows the same explicit-TODO pattern as the trust layer injection list.
+  ENFORCEMENT (when REQUIRE_SEMANTIC_VERIFICATION=true env var is set)
+    Rejects any request that lacks requester_public_key_b64.
+    Forces Branch 1 (and any other client) to supply the key for v0.3.
+    Error: POLICY_VIOLATION / HARD with a clear migration message.
+
+Runtime configuration:
+  REQUIRE_SEMANTIC_VERIFICATION=false   v0.2 compat: structural only when key absent
+  REQUIRE_SEMANTIC_VERIFICATION=true    v0.3 enforcement: reject if key absent
+
+The enforcement env var lets Markus flip the proxy to v0.3 mode for Branch 1
+without a code change, via docker-compose.yml environment override.
 
 Authors: Claude (Anthropic)
 """
@@ -40,6 +37,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
@@ -47,7 +45,17 @@ from cryptography.exceptions import InvalidSignature
 logger = logging.getLogger(__name__)
 
 _ED25519_SIG_BYTES = 64
+_ED25519_PUB_BYTES = 32
 
+# Runtime enforcement flag (Gemini advisory 2026-04-14)
+REQUIRE_SEMANTIC_VERIFICATION: bool = (
+    os.getenv("REQUIRE_SEMANTIC_VERIFICATION", "false").lower() == "true"
+)
+
+
+# ---------------------------------------------------------------------------
+# Result type
+# ---------------------------------------------------------------------------
 
 class SignatureVerificationResult:
     __slots__ = ("ok", "structural", "semantic", "detail")
@@ -65,10 +73,13 @@ class SignatureVerificationResult:
         )
 
 
+# ---------------------------------------------------------------------------
+# Low-level helpers
+# ---------------------------------------------------------------------------
+
 def _decode_base64url(value: str) -> bytes | None:
     """Decode a base64url string (with or without padding). Returns None on failure."""
     try:
-        # Add padding if needed
         padding = 4 - len(value) % 4
         if padding != 4:
             value += "=" * padding
@@ -77,33 +88,37 @@ def _decode_base64url(value: str) -> bytes | None:
         return None
 
 
-def _verify_ed25519(
-    public_key_bytes: bytes,
-    message: bytes,
-    signature_bytes: bytes,
-) -> bool:
+def canonical_signing_input(request_dict: dict) -> bytes:
     """
-    Verify an Ed25519 signature. Returns True if valid, False otherwise.
-    Used in TODO(v0.3) path once public keys are available.
+    Compute the canonical signing input for a ContactRequest.
+
+    Algorithm (spec/execution/canonical-serialization.md):
+      1. Remove the "signature" field from the dict
+      2. Serialize with RFC 8785-compatible JSON (sort_keys, no whitespace)
+      3. SHA-256 hash the UTF-8 bytes
+
+    Python's json.dumps(sort_keys=True, separators=(",",":")) satisfies RFC 8785
+    for all ContactRequest field types (strings, integers, arrays, nested objects).
+    No floats or special values appear in the schema.
     """
+    without_sig = {k: v for k, v in request_dict.items() if k != "signature"}
+    canonical = json.dumps(without_sig, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).digest()
+
+
+def _verify_ed25519(public_key_bytes: bytes, message: bytes, signature_bytes: bytes) -> bool:
+    """Verify an Ed25519 signature. Returns True if valid, False on any failure."""
     try:
         pub_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
         pub_key.verify(signature_bytes, message)
         return True
-    except (InvalidSignature, ValueError):
+    except (InvalidSignature, ValueError, Exception):
         return False
 
 
-def _canonical_signing_input(request_dict: dict) -> bytes:
-    """
-    Canonical signing input for a ContactRequest.
-    Defined as sha256(json.dumps(request_without_signature, sort_keys=True)).
-    This is the agreed standard for v0.3 semantic verification.
-    """
-    without_sig = {k: v for k, v in request_dict.items() if k != "signature"}
-    canonical = json.dumps(without_sig, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canonical.encode()).digest()
-
+# ---------------------------------------------------------------------------
+# Public verification API
+# ---------------------------------------------------------------------------
 
 def verify_request_signature(
     signature_str: str,
@@ -112,80 +127,90 @@ def verify_request_signature(
     request_dict: dict | None = None,
 ) -> SignatureVerificationResult:
     """
-    Verify a ContactRequest signature.
-
-    Current mode: structural only.
-    Future mode (v0.3): full semantic verification when requester_public_key_b64
-    and request_dict are provided.
+    Verify a ContactRequest signature. Mode selected by available inputs and env config.
 
     Args:
-        signature_str: the raw signature field from the ContactRequest
-        requester_did: for logging; not used in verification yet
-        requester_public_key_b64: base64url-encoded requester public key (optional)
-        request_dict: the full request as a dict, for canonical input (optional)
+        signature_str:            raw signature field from ContactRequest
+        requester_did:            for logging
+        requester_public_key_b64: base64url Ed25519 public key (optional, from request)
+        request_dict:             full request as dict, for canonical input computation
 
     Returns:
         SignatureVerificationResult
     """
-    # --- Structural check ---
+
+    # --- Structural check (always runs first) ---
     sig_bytes = _decode_base64url(signature_str)
 
     if sig_bytes is None:
         return SignatureVerificationResult(
-            ok=False,
-            structural=False,
-            semantic=None,
+            ok=False, structural=False, semantic=None,
             detail=f"signature is not valid base64url (requester={requester_did})",
         )
 
     if len(sig_bytes) != _ED25519_SIG_BYTES:
         return SignatureVerificationResult(
-            ok=False,
-            structural=False,
-            semantic=None,
+            ok=False, structural=False, semantic=None,
             detail=(
                 f"signature has wrong length: expected {_ED25519_SIG_BYTES} bytes, "
                 f"got {len(sig_bytes)} (requester={requester_did})"
             ),
         )
 
-    # --- Semantic check (v0.3 path) ---
+    # --- Semantic path: key is present ---
     if requester_public_key_b64 is not None and request_dict is not None:
         pub_bytes = _decode_base64url(requester_public_key_b64)
-        if pub_bytes is None or len(pub_bytes) != 32:
+
+        if pub_bytes is None or len(pub_bytes) != _ED25519_PUB_BYTES:
             return SignatureVerificationResult(
-                ok=False,
-                structural=True,
-                semantic=False,
-                detail=f"requester_public_key_b64 is not a valid 32-byte Ed25519 public key",
+                ok=False, structural=True, semantic=False,
+                detail=(
+                    f"requester_public_key_b64 is not a valid {_ED25519_PUB_BYTES}-byte "
+                    f"Ed25519 public key (requester={requester_did})"
+                ),
             )
-        message = _canonical_signing_input(request_dict)
+
+        message = canonical_signing_input(request_dict)
         valid = _verify_ed25519(pub_bytes, message, sig_bytes)
+
         if not valid:
             return SignatureVerificationResult(
-                ok=False,
-                structural=True,
-                semantic=False,
-                detail=f"Ed25519 signature verification failed (requester={requester_did})",
+                ok=False, structural=True, semantic=False,
+                detail=(
+                    f"Ed25519 signature does not match SHA-256(RFC8785(request)). "
+                    f"Ensure signing input follows spec/execution/canonical-serialization.md "
+                    f"(requester={requester_did})"
+                ),
             )
+
+        logger.info("semantic Ed25519 verification passed (requester=%s)", requester_did)
         return SignatureVerificationResult(
-            ok=True,
-            structural=True,
-            semantic=True,
-            detail="signature verified",
+            ok=True, structural=True, semantic=True,
+            detail="Ed25519 signature verified against RFC 8785 canonical input",
         )
 
-    # --- Structural-only path (current v0.2 behaviour) ---
-    # TODO(v0.3): remove this warning branch once semantic verification is wired in.
+    # --- No key present: check enforcement mode ---
+    if REQUIRE_SEMANTIC_VERIFICATION:
+        return SignatureVerificationResult(
+            ok=False, structural=True, semantic=False,
+            detail=(
+                "REQUIRE_SEMANTIC_VERIFICATION=true but requester_public_key_b64 "
+                "is absent from the request. "
+                "v0.3 migration required: include requester_public_key_b64 in "
+                "ContactRequest and sign SHA-256(RFC8785(request_without_signature)). "
+                "See spec/execution/canonical-serialization.md."
+            ),
+        )
+
+    # --- Structural-only fallback (v0.2 compat) ---
     logger.warning(
-        "structural-only signature check for requester=%s. "
-        "Semantic verification requires requester_public_key and agreed signing input. "
-        "See five_h_proxy/verification.py TODO(v0.3).",
+        "structural-only signature check for requester=%s "
+        "(REQUIRE_SEMANTIC_VERIFICATION=false, requester_public_key_b64 absent). "
+        "Set REQUIRE_SEMANTIC_VERIFICATION=true to enforce v0.3 cryptographic standard. "
+        "See spec/execution/canonical-serialization.md.",
         requester_did,
     )
     return SignatureVerificationResult(
-        ok=True,
-        structural=True,
-        semantic=None,
-        detail="structural check passed; semantic verification deferred (v0.3)",
+        ok=True, structural=True, semantic=None,
+        detail="structural check passed; semantic verification deferred (set REQUIRE_SEMANTIC_VERIFICATION=true for v0.3)",
     )
