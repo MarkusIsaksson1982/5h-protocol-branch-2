@@ -1,0 +1,41 @@
+[project]
+name = "five-h-proxy"
+version = "0.2.0"
+description = "5H Protocol – Python AI Proxy Reference Server"
+readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.11"
+authors = [
+    { name = "Claude, Anthropic", email = "noreply@anthropic.com" },
+    { name = "ChatGPT/Codex, OpenAI" },
+]
+dependencies = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.7",
+    "jsonschema>=4.22",
+    "python-jose[cryptography]>=3.3",
+    "cryptography>=42",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+five-h-proxy = "five_h_proxy.proxy:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["five_h_proxy"]
