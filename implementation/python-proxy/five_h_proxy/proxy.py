@@ -59,6 +59,7 @@ from .models import (
 )
 from .rate_limit import RateLimiter
 from .trust_layer import TrustVerdict, evaluate as trust_evaluate
+from .verification import verify_request_signature
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +186,22 @@ def _summarize(intent_summary: str) -> str:
 
 @app.post("/v1/proxy/forward", response_model=ProxyResponse)
 async def forward(request: ContactRequest) -> ProxyResponse:
+    # 0. Signature verification (structural; semantic deferred to v0.3)
+    #    See five_h_proxy/verification.py for the v0.3 TODO and alignment plan.
+    sig_result = verify_request_signature(
+        signature_str=request.signature,
+        requester_did=str(request.requester_did),
+    )
+    if not sig_result.ok:
+        return _reject(
+            request_id=request.request_id,
+            hop_number=request.hop_number,
+            error_code=ErrorCode.POLICY_VIOLATION,
+            message=f"Signature verification failed: {sig_result.detail}",
+            failure_class=FailureClass.HARD,
+            prior_receipts=request.consent_receipts,
+        )
+
     # 1. H-T Trust Layer
     trust_report = trust_evaluate(request, MODEL_VERSION_HASH)
     if not trust_report.passed:
