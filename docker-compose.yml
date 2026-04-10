@@ -41,6 +41,11 @@ services:
       - RECEIPT_STORE_DIR=/tmp/5h_receipts
       - RECEIPT_MODE=full_chain
       - SWEEP_INTERVAL=60
+      # v0.3 enforcement: set to true when Branch 1 complies with
+      # spec/execution/canonical-serialization.md (requester_public_key_b64
+      # in payload, signing over SHA-256(RFC8785(request_without_signature))).
+      # false = v0.2 compat (structural-only when key absent)
+      - REQUIRE_SEMANTIC_VERIFICATION=false
     command: uvicorn main:app --host 0.0.0.0 --port 8000
     volumes:
       - ./spec:/spec:ro
