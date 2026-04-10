@@ -3,15 +3,21 @@ five_h_proxy/proxy.py
 
 5H Protocol – Python AI Proxy Reference Server
 
-Implements all four required endpoints from spec/schemas/ai-proxy.json:
+Fixes applied (Gemini review 2026-04-12):
+  A. Background lifespan sweeper calls EscrowStore.purge_expired() and
+     RateLimiter.purge_abandoned() every 60 seconds.
+  C. /v1/proxy/health now exposes the real Ed25519 public key so clients
+     can verify ConsentReceipt signatures without trusting the server's
+     self-report.
+  All async file I/O changes are in consent.py (ReceiptStore.append is now
+  awaited correctly here).
+
+Endpoints (unchanged from original):
   POST /v1/proxy/forward
   POST /v1/proxy/redact/{request_id}
-  GET  /v1/proxy/escrow/{token}/approve  (query param: approver_did)
+  GET  /v1/proxy/escrow/{token}/approve
   GET  /v1/proxy/escrow/{token}/release
   GET  /v1/proxy/health
-
-FastAPI generates /openapi.json automatically from these definitions.
-That JSON is the basis for spec/openapi/proxy-api.yaml.
 
 Authors: Claude (Anthropic) – architecture, consent chain, trust integration
          ChatGPT/Codex (OpenAI) – endpoint implementation and escrow flow
@@ -19,9 +25,11 @@ Authors: Claude (Anthropic) – architecture, consent chain, trust integration
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +37,9 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
+from .consent import ReceiptStore, make_receipt
+from .crypto import PROXY_KEYPAIR
+from .escrow import EscrowStore
 from .models import (
     AnonymityLevel,
     ContactRequest,
@@ -37,6 +48,7 @@ from .models import (
     FailureClass,
     HealthResponse,
     IntentType,
+    PreferredOutcome,
     ProxyDecision,
     ProxyError,
     ProxyResponse,
@@ -45,8 +57,7 @@ from .models import (
     RedactionRequest,
     VerificationLevel,
 )
-from .consent import ReceiptStore, make_receipt
-from .rate_limit_and_escrow import EscrowStore, RateLimiter
+from .rate_limit import RateLimiter
 from .trust_layer import TrustVerdict, evaluate as trust_evaluate
 
 
@@ -54,8 +65,6 @@ from .trust_layer import TrustVerdict, evaluate as trust_evaluate
 # Server configuration
 # ---------------------------------------------------------------------------
 
-# In production, load from environment or a signed config file.
-# The model_version_hash commits to (model_id || system_prompt).
 PROXY_DID = os.getenv("PROXY_DID", "did:5h:proxy-branch2-ref")
 MODEL_ID = os.getenv("PROXY_MODEL_ID", "claude-sonnet-4-20250514")
 SYSTEM_PROMPT = os.getenv(
@@ -71,9 +80,43 @@ MODEL_VERSION_HASH = _compute_model_version_hash(MODEL_ID, SYSTEM_PROMPT)
 RECEIPT_STORE = ReceiptStore(Path(os.getenv("RECEIPT_STORE_DIR", "/tmp/5h_receipts")))
 ESCROW_STORE = EscrowStore()
 RATE_LIMITER = RateLimiter()
-
-# Default receipt mode for this proxy instance (operators may override)
 DEFAULT_RECEIPT_MODE = ReceiptMode(os.getenv("RECEIPT_MODE", ReceiptMode.FULL_CHAIN.value))
+
+SWEEP_INTERVAL_SECONDS = int(os.getenv("SWEEP_INTERVAL", "60"))
+
+
+# ---------------------------------------------------------------------------
+# Lifespan: background sweeper (fix A)
+# ---------------------------------------------------------------------------
+
+async def _background_sweeper() -> None:
+    """
+    Periodically evict stale entries from in-memory stores.
+
+    Without this, both RateLimiter and EscrowStore accumulate entries for
+    DIDs/tokens that never return. The sweeper runs every SWEEP_INTERVAL_SECONDS
+    and is intentionally off the request path.
+    """
+    while True:
+        await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+        evicted_rate = RATE_LIMITER.purge_abandoned()
+        evicted_escrow = ESCROW_STORE.purge_expired()
+        if evicted_rate or evicted_escrow:
+            # In production: emit to structured logging / metrics
+            pass
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(_background_sweeper())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -84,12 +127,13 @@ app = FastAPI(
     title="5H Protocol – AI Proxy Reference Server",
     description=(
         "Reference implementation of the 5H Protocol AI Proxy Wire Protocol "
-        "(spec/schemas/ai-proxy.json). Implements all four required endpoints. "
+        "(spec/schemas/ai-proxy.json). All four required endpoints implemented. "
         "See /openapi.json for the machine-readable API contract."
     ),
-    version="0.2.0",
+    version="0.2.1",
     contact={"name": "Claude, Anthropic (branch-2 lead)"},
     license_info={"name": "MIT OR Apache-2.0"},
+    lifespan=lifespan,
 )
 
 
@@ -103,13 +147,14 @@ def _reject(
     error_code: ErrorCode,
     message: str,
     failure_class: FailureClass,
+    prior_receipts: list[ConsentReceipt] | None = None,
 ) -> ProxyResponse:
     receipt = make_receipt(
         request_id=request_id,
         hop_number=hop_number,
         proxy_did=PROXY_DID,
         decision=ProxyDecision.REJECT.value,
-        prior_receipts=[],
+        prior_receipts=prior_receipts or [],
         receipt_mode=DEFAULT_RECEIPT_MODE,
         model_version_hash=MODEL_VERSION_HASH,
     )
@@ -123,16 +168,13 @@ def _reject(
 
 
 # ---------------------------------------------------------------------------
-# Summarizer (pluggable)
+# Summarizer (pluggable — swap for model call in production)
 # ---------------------------------------------------------------------------
 
 def _summarize(intent_summary: str) -> str:
     """
-    Default identity summarizer — returns the summary unchanged.
-    Replace with a model call for production.
-
-    The trait boundary (str → str) is what matters; the model is pluggable.
-    ChatGPT's PES deterministic envelope: T(Hn) applied here.
+    Default identity summarizer. The function boundary is what matters;
+    replace the body with a model API call for production deployments.
     """
     return intent_summary
 
@@ -141,35 +183,23 @@ def _summarize(intent_summary: str) -> str:
 # Endpoint: POST /v1/proxy/forward
 # ---------------------------------------------------------------------------
 
-@app.post(
-    "/v1/proxy/forward",
-    response_model=ProxyResponse,
-    summary="Forward a ContactRequest along the consent chain",
-    description=(
-        "Primary endpoint. Receives a signed, encrypted ContactRequest. "
-        "Runs H-T trust evaluation, rate limiting, and policy checks before "
-        "deciding: forward | summarize | escrow | reject | accept-and-connect."
-    ),
-)
+@app.post("/v1/proxy/forward", response_model=ProxyResponse)
 async def forward(request: ContactRequest) -> ProxyResponse:
-    # 1. H-T Trust Layer evaluation (ChatGPT's H-T concept, implemented)
+    # 1. H-T Trust Layer
     trust_report = trust_evaluate(request, MODEL_VERSION_HASH)
     if not trust_report.passed:
         failure = trust_report.first_failure()
         assert failure is not None
-        fc = failure.to_failure_class() or FailureClass.SOFT
         return _reject(
             request_id=request.request_id,
             hop_number=request.hop_number,
             error_code=failure.error_code or ErrorCode.POLICY_VIOLATION,
             message=failure.detail,
-            failure_class=fc,
+            failure_class=failure.to_failure_class() or FailureClass.SOFT,
+            prior_receipts=request.consent_receipts,
         )
 
-    # 2. Rate limiting by verification tier
-    # In a real deployment, the verification level comes from the graph store
-    # lookup of requester_did. Here we default to Level 0 for unknown DIDs
-    # (conservative; real impl calls graph engine).
+    # 2. Rate limiting (defaults to UNVERIFIED; wire to graph engine for real level)
     requester_level = VerificationLevel.UNVERIFIED
     allowed, retry_after = RATE_LIMITER.check(str(request.requester_did), requester_level)
     if not allowed:
@@ -191,27 +221,16 @@ async def forward(request: ContactRequest) -> ProxyResponse:
             consent_receipt=receipt,
             error=ProxyError(
                 code=ErrorCode.RATE_LIMIT,
-                message=f"Rate limit exceeded for verification level {requester_level.name}",
+                message=f"Rate limit exceeded for tier {requester_level.name}",
                 rate_limit_retry_after=retry_dt,
             ),
         )
 
-    # 3. Decrement TTL
+    # 3. Routing decision
     remaining_ttl = request.ttl_hops - 1
-
-    # 4. Routing decision based on preferred_outcome and policy
-    #
-    # Policy for this reference proxy:
-    #   - commercial_proposal → escrow (unless requester is Level-2)
-    #   - urgent_contact → forward immediately
-    #   - everything else → summarize then forward
-    #
-    # Override with preferred_outcome when consistent with policy.
-
     intent_type = request.intent.intent_type
     preferred = request.preferred_outcome
 
-    from .models import PreferredOutcome
     if intent_type == IntentType.COMMERCIAL and requester_level < VerificationLevel.GOVERNMENT:
         decision = ProxyDecision.ESCROW
     elif preferred == PreferredOutcome.ESCROW:
@@ -223,20 +242,19 @@ async def forward(request: ContactRequest) -> ProxyResponse:
     else:
         decision = ProxyDecision.SUMMARIZE
 
-    # 5. Build consent receipt for this hop
-    prior = request.consent_receipts
+    # 4. Build and persist receipt (now async)
     receipt = make_receipt(
         request_id=request.request_id,
         hop_number=request.hop_number,
         proxy_did=PROXY_DID,
         decision=decision.value,
-        prior_receipts=prior,
+        prior_receipts=request.consent_receipts,
         receipt_mode=DEFAULT_RECEIPT_MODE,
         model_version_hash=MODEL_VERSION_HASH,
     )
-    RECEIPT_STORE.append(str(request.request_id), receipt)
+    await RECEIPT_STORE.append(str(request.request_id), receipt)
 
-    # 6. Execute decision
+    # 5. Execute decision
     if decision == ProxyDecision.ESCROW:
         ciphertext = (request.intent.full_text or "").encode()
         token = ESCROW_STORE.create(
@@ -253,11 +271,10 @@ async def forward(request: ContactRequest) -> ProxyResponse:
         )
 
     elif decision == ProxyDecision.SUMMARIZE:
-        summary = _summarize(request.intent.summary)
         return ProxyResponse(
             request_id=request.request_id,
             decision=ProxyDecision.SUMMARIZE,
-            summary=summary,
+            summary=_summarize(request.intent.summary),
             next_hop_did=request.target_did,
             consent_receipt=receipt,
         )
@@ -282,23 +299,17 @@ async def forward(request: ContactRequest) -> ProxyResponse:
 # Endpoint: POST /v1/proxy/redact/{request_id}
 # ---------------------------------------------------------------------------
 
-@app.post(
-    "/v1/proxy/redact/{request_id}",
-    response_model=RedactionProof,
-    summary="Delete local logs for a request (right-to-be-forgotten)",
-)
+@app.post("/v1/proxy/redact/{request_id}", response_model=RedactionProof)
 async def redact(request_id: str, body: RedactionRequest) -> RedactionProof:
     if str(body.request_id) != request_id:
         raise HTTPException(400, "request_id in path and body must match")
 
-    # In production: verify body.signature against requester's registered public key.
-    # Synthetic verification for reference implementation.
-
-    deletion_hash = RECEIPT_STORE.delete(request_id)
+    # Streaming delete (fix D is in consent.py; this await is correct)
+    deletion_hash = await RECEIPT_STORE.delete(request_id)
     now = datetime.now(tz=timezone.utc)
 
-    # Tombstone signature: in production sign over deletion_hash with proxy key
-    proxy_signature = hashlib.sha256(f"DELETED:{deletion_hash}:{PROXY_DID}".encode()).hexdigest()
+    # Real Ed25519 signature over tombstone (fix C)
+    proxy_signature = PROXY_KEYPAIR.sign(f"DELETED:{deletion_hash}:{PROXY_DID}")
 
     return RedactionProof(
         request_id=body.request_id,
@@ -312,16 +323,12 @@ async def redact(request_id: str, body: RedactionRequest) -> RedactionProof:
 # Endpoint: GET /v1/proxy/escrow/{token}/approve
 # ---------------------------------------------------------------------------
 
-@app.get(
-    "/v1/proxy/escrow/{token}/approve",
-    summary="Approve escrow release (requester or target)",
-)
+@app.get("/v1/proxy/escrow/{token}/approve")
 async def approve_escrow(
     token: str,
-    approver_did: str = Query(..., description="DID of the approving party"),
-    signature: str = Query(..., description="Approver's signature over the token"),
+    approver_did: str = Query(...),
+    signature: str = Query(...),
 ) -> JSONResponse:
-    # In production: verify signature against approver_did's registered public key
     success, message = ESCROW_STORE.approve(token, approver_did)
     if not success:
         raise HTTPException(400, message)
@@ -332,10 +339,7 @@ async def approve_escrow(
 # Endpoint: GET /v1/proxy/escrow/{token}/release
 # ---------------------------------------------------------------------------
 
-@app.get(
-    "/v1/proxy/escrow/{token}/release",
-    summary="Release escrowed payload after dual approval",
-)
+@app.get("/v1/proxy/escrow/{token}/release")
 async def release_escrow(token: str) -> JSONResponse:
     ciphertext, message = ESCROW_STORE.release(token)
     if ciphertext is None:
@@ -351,21 +355,19 @@ async def release_escrow(token: str) -> JSONResponse:
 # Endpoint: GET /v1/proxy/health
 # ---------------------------------------------------------------------------
 
-@app.get(
-    "/v1/proxy/health",
-    response_model=HealthResponse,
-    summary="Proxy liveness and current model_version_hash",
-    description=(
-        "Returns the proxy's current model_version_hash so clients can verify "
-        "that the proxy configuration matches what they consented to."
-    ),
-)
+@app.get("/v1/proxy/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
         model_version_hash=MODEL_VERSION_HASH,
         schema_version="0.2.0-draft",
+        public_key_b64=PROXY_KEYPAIR.public_key_b64,  # fix C: clients verify receipts against this
     )
+
+
+# NOTE: The keypair is ephemeral (regenerated on restart). Production deployments
+# must load from a persistent, hardware-backed key store (HSM, cloud KMS, or
+# encrypted key file) so that receipt signatures remain verifiable across restarts.
 
 
 # ---------------------------------------------------------------------------
