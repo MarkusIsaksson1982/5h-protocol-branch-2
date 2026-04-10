@@ -218,6 +218,13 @@ def check_intent_consistency(request: ContactRequest) -> TrustCheckResult:
 # Patterns that indicate prompt injection or instruction override attempts.
 # These are deliberately conservative — false negatives are safer than
 # false positives for a consent-routing protocol.
+#
+# TODO(v0.3): Replace this regex list with an LLM-based classifier or a
+# dedicated library (e.g. lakera-guard). This list is bypassable via token
+# smuggling, Unicode variations, or whitespace injection.
+# The function signature (str -> TrustCheckResult) is intentionally stable
+# so the implementation can be swapped without touching callers.
+# Do NOT extend this regex list as a substitute for that upgrade.
 _INJECTION_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"ignore (previous|prior|all) instructions?", re.IGNORECASE),
     re.compile(r"disregard (your|the) (system |prior )?prompt", re.IGNORECASE),
