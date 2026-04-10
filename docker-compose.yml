@@ -1,0 +1,65 @@
+version: '3.9'
+
+# 5H Protocol – Docker Compose
+# Wires Branch 1 Rust core (graph engine + path-finder) to
+# Branch 2 Python proxy (H-T trust layer + consent receipts + escrow).
+#
+# Usage:
+#   docker-compose up --build
+#
+# The rust-core service runs examples/full_flow.rs, which:
+#   1. Loads spec/test-vectors/15-node-graph.json
+#   2. Finds a privacy-preserving path (Alice → Margaret)
+#   3. Signs a ContactRequest with an ephemeral Ed25519 keypair
+#   4. POSTs to http://python-proxy:8000/v1/proxy/forward
+#
+# The python-proxy service is Branch 2's reference server.
+# It replaces Branch 1's TemporalProxy mock (main.py).
+
+services:
+  rust-core:
+    build: ./implementation/rust-core
+    depends_on:
+      python-proxy:
+        condition: service_healthy   # wait for proxy healthcheck to pass
+    environment:
+      - RUST_LOG=info
+      - PROXY_URL=http://python-proxy:8000  # consumed by full_flow.rs via env
+    command: cargo run --example full_flow
+    volumes:
+      - ./spec:/spec:ro
+    networks:
+      - fiveh
+
+  python-proxy:
+    build: ./implementation/python-proxy
+    ports:
+      - "8000:8000"
+    environment:
+      - PROXY_DID=did:5h:proxy-branch2-ref
+      - PROXY_MODEL_ID=claude-sonnet-4-20250514
+      - RECEIPT_STORE_DIR=/tmp/5h_receipts
+      - RECEIPT_MODE=full_chain
+      - SWEEP_INTERVAL=60
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - ./spec:/spec:ro
+      - receipt_store:/tmp/5h_receipts
+    networks:
+      - fiveh
+    # Healthcheck matches the HEALTHCHECK in the Dockerfile; compose
+    # uses this to gate rust-core startup via depends_on condition above.
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/v1/proxy/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  receipt_store:
+
+networks:
+  fiveh:
+    driver: bridge
