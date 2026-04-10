@@ -186,11 +186,15 @@ def _summarize(intent_summary: str) -> str:
 
 @app.post("/v1/proxy/forward", response_model=ProxyResponse)
 async def forward(request: ContactRequest) -> ProxyResponse:
-    # 0. Signature verification (structural; semantic deferred to v0.3)
-    #    See five_h_proxy/verification.py for the v0.3 TODO and alignment plan.
+    # 0. Signature verification
+    #    Semantic when requester_public_key_b64 is present (v0.3+).
+    #    Enforcement mode when REQUIRE_SEMANTIC_VERIFICATION=true.
+    #    See five_h_proxy/verification.py and spec/execution/canonical-serialization.md.
     sig_result = verify_request_signature(
         signature_str=request.signature,
         requester_did=str(request.requester_did),
+        requester_public_key_b64=request.requester_public_key_b64,
+        request_dict=request.model_dump(mode="json") if request.requester_public_key_b64 else None,
     )
     if not sig_result.ok:
         return _reject(
